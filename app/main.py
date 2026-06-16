@@ -288,6 +288,132 @@ def deindex(request: DeindexRequest):
     }
 
 
+@app.post("/books/sync-index")
+def books_sync_index(dry_run: bool = False):
+    logger.info("[SYNC] /books/sync-index endpoint entered dry_run=%s", dry_run)
+
+    try:
+        candidates = _select_candidates(
+            _discover_book_candidates(),
+            repository=None,
+            language=None,
+            sort_by="path",
+            max_mb=None,
+        )
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        return {
+            "status": "error",
+            "message": str(exc),
+        }
+
+    books = _hash_selected_candidates(candidates)
+    filesystem_by_hash = _group_books_by_hash(books)
+    vector_store = get_rag().vector_store
+    indexed_documents = vector_store.list_indexed_documents()
+    indexed_hashes = {document["document_hash"] for document in indexed_documents}
+
+    removed = []
+    moved = []
+    unchanged = 0
+    ambiguous = []
+
+    for document in indexed_documents:
+        document_hash = document["document_hash"]
+        current_books = filesystem_by_hash.get(document_hash, [])
+
+        if not current_books:
+            detail = {
+                "document_hash": document_hash,
+                "old": _indexed_document_metadata(document),
+                "point_count": document["point_count"],
+                "statuses": document["statuses"],
+            }
+            if not dry_run:
+                vector_store.delete_document_points(document_hash=document_hash)
+            removed.append(detail)
+            continue
+
+        current_metadata_options = [_book_sync_metadata(book) for book in current_books]
+        old_metadata = _indexed_document_metadata(document)
+        matching_metadata = [
+            metadata
+            for metadata in current_metadata_options
+            if metadata == old_metadata
+        ]
+
+        if matching_metadata:
+            unchanged += 1
+            continue
+
+        if len(current_metadata_options) > 1:
+            ambiguous.append({
+                "document_hash": document_hash,
+                "old": old_metadata,
+                "current_options": current_metadata_options,
+                "point_count": document["point_count"],
+                "statuses": document["statuses"],
+            })
+            continue
+
+        new_metadata = current_metadata_options[0]
+        detail = {
+            "document_hash": document_hash,
+            "old": old_metadata,
+            "new": new_metadata,
+            "point_count": document["point_count"],
+            "statuses": document["statuses"],
+        }
+        if not dry_run:
+            vector_store.update_document_metadata(document_hash, new_metadata)
+        moved.append(detail)
+
+    new_unindexed = [
+        _book_hash_result(book)
+        for document_hash, current_books in filesystem_by_hash.items()
+        if document_hash not in indexed_hashes
+        for book in current_books
+    ]
+    duplicate_files = [
+        {
+            "document_hash": document_hash,
+            "files": [_book_hash_result(book) for book in current_books],
+        }
+        for document_hash, current_books in filesystem_by_hash.items()
+        if len(current_books) > 1
+    ]
+
+    response = {
+        "status": "ok",
+        "dry_run": dry_run,
+        "books_root": str(BOOKS_ROOT.resolve()),
+        "filesystem_documents": len(filesystem_by_hash),
+        "filesystem_files": len(books),
+        "indexed_documents": len(indexed_documents),
+        "removed": len(removed),
+        "moved": len(moved),
+        "unchanged": unchanged,
+        "ambiguous": len(ambiguous),
+        "new_unindexed": len(new_unindexed),
+        "duplicate_hashes": len(duplicate_files),
+        "details": {
+            "removed": removed,
+            "moved": moved,
+            "ambiguous": ambiguous,
+            "new_unindexed": new_unindexed,
+            "duplicate_hashes": duplicate_files,
+        },
+    }
+    logger.info(
+        "[SYNC] complete: removed=%s moved=%s ambiguous=%s new_unindexed=%s dry_run=%s",
+        response["removed"],
+        response["moved"],
+        response["ambiguous"],
+        response["new_unindexed"],
+        dry_run,
+    )
+    return response
+
+
 @app.post("/ingest/all")
 def ingest_all(
     limit: int | None = Query(default=None, ge=0),
@@ -763,6 +889,35 @@ def _book_hash_result(book: BookFile) -> dict:
         "document_hash": book.sha256,
         "topic_path": book.topic_path,
         "file_name": book.file_name,
+    }
+
+
+def _group_books_by_hash(books: list[BookFile]) -> dict[str, list[BookFile]]:
+    grouped = {}
+    for book in books:
+        grouped.setdefault(book.sha256, []).append(book)
+    return grouped
+
+
+def _book_sync_metadata(book: BookFile) -> dict:
+    return {
+        "repository": book.repository,
+        "language": book.language,
+        "relative_path": book.relative_path,
+        "topic_path": book.topic_path,
+        "file_name": book.file_name,
+        "book": Path(book.file_name).stem,
+    }
+
+
+def _indexed_document_metadata(document: dict) -> dict:
+    return {
+        "repository": document.get("repository"),
+        "language": document.get("language"),
+        "relative_path": document.get("relative_path"),
+        "topic_path": document.get("topic_path"),
+        "file_name": document.get("file_name"),
+        "book": document.get("book"),
     }
 
 

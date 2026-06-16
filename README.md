@@ -290,6 +290,15 @@ curl.exe -X POST http://localhost:8000/deindex `
   -d "{\"document_hash\":\"...\"}"
 ```
 
+Synchronize Qdrant metadata after moving or removing PDFs under `BOOKS_ROOT`:
+
+```powershell
+curl.exe -X POST "http://localhost:8000/books/sync-index?dry_run=true"
+curl.exe -X POST http://localhost:8000/books/sync-index
+```
+
+The sync endpoint scans current PDFs, compares them to indexed documents by SHA-256 hash, deletes Qdrant points for removed PDFs, and updates repository/path/language metadata for moved PDFs without re-embedding. New PDFs are reported as `new_unindexed`; ingest them with `/ingest/all`.
+
 Embedding diagnostics:
 
 ```bash

@@ -112,6 +112,81 @@ class VectorStore:
             points_selector=point_ids,
         )
 
+    def update_document_metadata(self, document_hash: str, metadata: dict) -> None:
+        self.client.set_payload(
+            collection_name=COLLECTION_NAME,
+            payload=metadata,
+            points=self._document_filter(document_hash=document_hash),
+        )
+
+    def list_indexed_documents(self) -> list[dict]:
+        documents = {}
+        offset = None
+        payload_fields = [
+            "document_hash",
+            "document_status",
+            "repository",
+            "language",
+            "relative_path",
+            "topic_path",
+            "file_name",
+            "book",
+        ]
+
+        while True:
+            batch, offset = self.client.scroll(
+                collection_name=COLLECTION_NAME,
+                limit=256,
+                with_payload=payload_fields,
+                with_vectors=False,
+                offset=offset,
+            )
+
+            if not batch:
+                break
+
+            for record in batch:
+                payload = record.payload or {}
+                document_hash = payload.get("document_hash")
+                if not document_hash:
+                    continue
+
+                document = documents.setdefault(
+                    document_hash,
+                    {
+                        "document_hash": document_hash,
+                        "repository": None,
+                        "language": None,
+                        "relative_path": None,
+                        "topic_path": None,
+                        "file_name": None,
+                        "book": None,
+                        "point_count": 0,
+                        "statuses": set(),
+                    },
+                )
+
+                document["point_count"] += 1
+                status = payload.get("document_status")
+                if status:
+                    document["statuses"].add(status)
+
+                for key in ("repository", "language", "relative_path", "topic_path", "file_name", "book"):
+                    value = payload.get(key)
+                    if document.get(key) is None and value is not None:
+                        document[key] = value
+
+            if offset is None:
+                break
+
+        return [
+            {
+                **document,
+                "statuses": sorted(document["statuses"]),
+            }
+            for document in documents.values()
+        ]
+
     def list_no_text_documents(
         self,
         repository: str | None = None,
