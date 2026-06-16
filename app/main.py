@@ -1,15 +1,25 @@
+import logging
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
 from app.book_scanner import BookFile, describe_book_file, scan_books
-from app.config import BOOKS_ROOT, DEFAULT_REPOSITORY, LLM_MODEL, SUPPORTED_LANGUAGES, SUPPORTED_REPOSITORIES
+from app.config import (
+    BOOKS_ROOT,
+    COLLECTION_NAME,
+    DEFAULT_REPOSITORY,
+    EMBEDDING_MODEL,
+    LLM_MODEL,
+    SUPPORTED_LANGUAGES,
+    SUPPORTED_REPOSITORIES,
+)
 from app.rag import RagService
 
 app = FastAPI(title="Private RAG Philosophy Bot")
 
 rag = RagService()
+logger = logging.getLogger(__name__)
 
 
 class IngestRequest(BaseModel):
@@ -27,7 +37,24 @@ class ChatRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    response = {
+        "status": "ok",
+        "qdrant": "ok",
+        "collection": COLLECTION_NAME,
+        "points_count": 0,
+        "embedding_model": EMBEDDING_MODEL,
+        "default_llm": LLM_MODEL
+    }
+
+    try:
+        response["points_count"] = rag.vector_store.points_count()
+    except Exception as exc:
+        response["status"] = "degraded"
+        response["qdrant"] = "error"
+        response["points_count"] = None
+        response["qdrant_error"] = str(exc)
+
+    return response
 
 
 @app.get("/books/scan")
@@ -70,7 +97,21 @@ def ingest(request: IngestRequest):
 
 
 @app.post("/ingest/all")
-def ingest_all():
+def ingest_all(
+    limit: int | None = Query(default=None, ge=0),
+    repository: str | None = None,
+    language: str | None = None,
+    dry_run: bool = False
+):
+    if repository is not None:
+        _validate_values([repository], SUPPORTED_REPOSITORIES, "repository")
+    if language is not None:
+        _validate_values([language], SUPPORTED_LANGUAGES, "language")
+
+    logger.info("[INGEST] Starting full ingestion")
+    logger.info("[INGEST] Books root: %s", BOOKS_ROOT.resolve())
+    logger.info("[INGEST] Scanning for PDF files")
+
     try:
         books = scan_books()
     except (FileNotFoundError, NotADirectoryError) as exc:
@@ -79,30 +120,100 @@ def ingest_all():
             "message": str(exc)
         }
 
-    details = []
-    for book in books:
-        try:
-            details.append(rag.ingest_book(book))
-        except Exception as exc:
-            details.append({
-                "file": book.relative_path,
-                "repository": book.repository,
-                "language": book.language,
-                "document_hash": book.sha256,
-                "status": "failed",
-                "chunks": 0,
-                "error": str(exc)
-            })
+    discovered_count = len(books)
+    logger.info("[INGEST] Discovered %s PDF files", discovered_count)
 
-    return {
+    books = _filter_books(books, repository=repository, language=language)
+    selected_before_limit = len(books)
+
+    if limit is not None:
+        books = books[:limit]
+
+    if repository is not None or language is not None or limit is not None:
+        logger.info(
+            "[INGEST] Selected %s PDF files after filters repository=%s language=%s limit=%s",
+            len(books),
+            repository,
+            language,
+            limit,
+        )
+
+    details = []
+    total = len(books)
+
+    if dry_run:
+        logger.info("[INGEST] Dry run enabled; no PDFs will be parsed, embedded, or upserted")
+        for index, book in enumerate(books, start=1):
+            logger.info(
+                "[INGEST] [%s/%s] Dry run: would process %s repository=%s language=%s sha256=%s",
+                index,
+                total,
+                book.relative_path,
+                book.repository,
+                book.language,
+                book.sha256,
+            )
+            details.append(_book_result(book, status="dry_run"))
+
+        response = _ingest_all_response(
+            details=details,
+            discovered=discovered_count,
+            selected=total,
+            selected_before_limit=selected_before_limit,
+            dry_run=dry_run,
+        )
+        logger.info("[INGEST] Dry run complete: would_process=%s", response["would_process"])
+        return response
+
+    for index, book in enumerate(books, start=1):
+        try:
+            details.append(rag.ingest_book(book, index=index, total=total))
+        except Exception as exc:
+            logger.exception("[INGEST] [%s/%s] Unexpected ingestion failure", index, total)
+            details.append(_book_result(book, status="failed", error=str(exc)))
+
+    response = _ingest_all_response(
+        details=details,
+        discovered=discovered_count,
+        selected=total,
+        selected_before_limit=selected_before_limit,
+        dry_run=dry_run,
+    )
+    logger.info(
+        "[INGEST] Full ingestion complete: indexed=%s skipped=%s no_text=%s failed=%s",
+        response["indexed"],
+        response["skipped"],
+        response["no_text"],
+        response["failed"],
+    )
+    return response
+
+
+def _ingest_all_response(
+    details: list[dict],
+    discovered: int,
+    selected: int,
+    selected_before_limit: int,
+    dry_run: bool
+) -> dict:
+    response = {
         "status": "ok",
-        "books_root": str(BOOKS_ROOT),
+        "books_root": str(BOOKS_ROOT.resolve()),
+        "discovered": discovered,
+        "selected": selected,
+        "selected_before_limit": selected_before_limit,
+        "dry_run": dry_run,
         "indexed": _count_status(details, "indexed"),
         "skipped": _count_status(details, "skipped"),
         "no_text": _count_status(details, "no_text"),
         "failed": _count_status(details, "failed"),
         "details": details
     }
+
+    if dry_run:
+        response["would_process"] = _count_status(details, "dry_run")
+
+    return response
 
 
 @app.post("/chat")
@@ -140,6 +251,36 @@ def _resolve_book(request: IngestRequest) -> BookFile | None:
             return book
 
     return None
+
+
+def _filter_books(
+    books: list[BookFile],
+    repository: str | None,
+    language: str | None
+) -> list[BookFile]:
+    return [
+        book
+        for book in books
+        if (repository is None or book.repository == repository)
+        and (language is None or book.language == language)
+    ]
+
+
+def _book_result(
+    book: BookFile,
+    status: str,
+    chunks: int = 0,
+    error: str | None = None
+) -> dict:
+    return {
+        "file": book.relative_path,
+        "repository": book.repository,
+        "language": book.language,
+        "document_hash": book.sha256,
+        "status": status,
+        "chunks": chunks,
+        "error": error
+    }
 
 
 def _validate_values(values: list[str], supported_values: set[str], field_name: str) -> None:

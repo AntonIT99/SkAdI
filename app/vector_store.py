@@ -1,5 +1,15 @@
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, FieldCondition, Filter, MatchAny, MatchValue, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    IsEmptyCondition,
+    MatchAny,
+    MatchValue,
+    PayloadField,
+    PointStruct,
+    VectorParams,
+)
 
 from app.config import QDRANT_URL, COLLECTION_NAME
 
@@ -32,17 +42,24 @@ class VectorStore:
     def document_exists(self, document_hash: str) -> bool:
         result = self.client.count(
             collection_name=COLLECTION_NAME,
-            count_filter=Filter(
-                must=[
-                    FieldCondition(
-                        key="document_hash",
-                        match=MatchValue(value=document_hash)
-                    )
-                ]
-            ),
+            count_filter=self._complete_document_filter(document_hash),
             exact=True
         )
         return result.count > 0
+
+    def mark_points_complete(self, point_ids: list[str]) -> None:
+        if not point_ids:
+            return
+
+        self.client.set_payload(
+            collection_name=COLLECTION_NAME,
+            payload={"document_status": "complete"},
+            points=point_ids,
+        )
+
+    def points_count(self) -> int:
+        collection = self.client.get_collection(collection_name=COLLECTION_NAME)
+        return collection.points_count or 0
 
     def search(
         self,
@@ -83,6 +100,17 @@ class VectorStore:
             FieldCondition(
                 key="repository",
                 match=self._match_values(repositories)
+            ),
+            Filter(
+                should=[
+                    FieldCondition(
+                        key="document_status",
+                        match=MatchValue(value="complete")
+                    ),
+                    IsEmptyCondition(
+                        is_empty=PayloadField(key="document_status")
+                    )
+                ]
             )
         ]
 
@@ -100,3 +128,17 @@ class VectorStore:
         if len(values) == 1:
             return MatchValue(value=values[0])
         return MatchAny(any=values)
+
+    def _complete_document_filter(self, document_hash: str) -> Filter:
+        return Filter(
+            must=[
+                FieldCondition(
+                    key="document_hash",
+                    match=MatchValue(value=document_hash)
+                ),
+                FieldCondition(
+                    key="document_status",
+                    match=MatchValue(value="complete")
+                )
+            ]
+        )
