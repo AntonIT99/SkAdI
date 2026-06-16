@@ -36,6 +36,8 @@ Pull the default LLM:
 ollama pull qwen3:14b
 ```
 
+You can select another installed model with the `LLM_MODEL` environment variable.
+
 Optional models:
 
 ```bash

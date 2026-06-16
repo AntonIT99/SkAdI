@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 logging.basicConfig(
@@ -27,6 +28,7 @@ from app.config import (
     SUPPORTED_REPOSITORIES,
 )
 from app.embeddings import embedding_diagnostics
+from app.llm import LlmServiceUnavailable
 from app.rag import RagService
 
 app = FastAPI(title="Private RAG Philosophy Bot")
@@ -85,12 +87,19 @@ def health():
     }
 
     try:
-        response["points_count"] = get_rag().vector_store.points_count()
+        rag = get_rag()
+        response["points_count"] = rag.vector_store.points_count()
+        response["ollama"] = rag.llm.diagnostics(LLM_MODEL)
+        if response["ollama"]["status"] != "ok":
+            response["status"] = "degraded"
     except Exception as exc:
         response["status"] = "degraded"
         response["qdrant"] = "error"
         response["points_count"] = None
         response["qdrant_error"] = str(exc)
+
+    if response["status"] != "ok":
+        return JSONResponse(status_code=503, content=response)
 
     return response
 
@@ -525,13 +534,23 @@ def chat(request: ChatRequest):
     if request.languages is not None:
         _validate_values(request.languages, SUPPORTED_LANGUAGES, "languages")
 
-    return get_rag().chat(
-        question=request.question,
-        repository=request.repository,
-        repositories=repositories,
-        languages=request.languages,
-        model=request.model
-    )
+    try:
+        return get_rag().chat(
+            question=request.question,
+            repository=request.repository,
+            repositories=repositories,
+            languages=request.languages,
+            model=request.model
+        )
+    except LlmServiceUnavailable as exc:
+        logger.warning("[CHAT] LLM service unavailable: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "LLM service unavailable",
+                "error": str(exc),
+            }
+        ) from exc
 
 
 def _resolve_book(request: IngestRequest) -> BookFile | None:
