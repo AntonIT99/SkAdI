@@ -87,6 +87,31 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
+### CUDA PyTorch for NVIDIA GPUs
+
+For Windows with an NVIDIA GPU, install the CUDA-enabled PyTorch build:
+
+```powershell
+pip uninstall torch torchvision torchaudio -y
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+```
+
+Verify PyTorch can see CUDA:
+
+```powershell
+python -c "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+```
+
+Embedding device and batch size can be configured with environment variables:
+
+```powershell
+$env:EMBEDDING_DEVICE="auto"
+$env:EMBEDDING_DEVICE="cuda"
+$env:EMBEDDING_BATCH_SIZE="64"
+```
+
+`EMBEDDING_DEVICE=auto` uses CUDA when PyTorch reports CUDA is available; otherwise it falls back to CPU.
+
 ## Start Qdrant
 
 Start the vector database:
@@ -176,6 +201,11 @@ Expected response:
   "collection": "books",
   "points_count": 12345,
   "embedding_model": "BAAI/bge-m3",
+  "embedding_device_config": "auto",
+  "embedding_device_selected": "cuda",
+  "cuda_available": true,
+  "cuda_version": "12.8",
+  "gpu_name": "NVIDIA GeForce RTX 5070 Ti",
   "default_llm": "qwen3:14b"
 }
 ```
@@ -186,6 +216,7 @@ Use these commands when `/ingest/all` appears slow or Qdrant still shows `points
 
 ```powershell
 curl.exe http://localhost:8000/health
+curl.exe http://localhost:8000/debug/embedding
 curl.exe http://localhost:8000/debug/config
 curl.exe http://localhost:8000/debug/routes
 curl.exe -X POST "http://localhost:8000/ingest/all?dry_run=true&limit=3"
@@ -206,6 +237,30 @@ force_reindex=true
 ```
 
 `force_reindex=true` disables the complete-document hash skip. It does not delete old chunks for changed files; it only writes the current document chunks.
+
+Embedding diagnostics:
+
+```bash
+curl http://localhost:8000/debug/embedding
+```
+
+Response shape:
+
+```json
+{
+  "torch_version": "2.7.0+cu128",
+  "cuda_available": true,
+  "torch_cuda_version": "12.8",
+  "device_count": 1,
+  "devices": [
+    {
+      "index": 0,
+      "name": "NVIDIA GeForce RTX 5070 Ti"
+    }
+  ],
+  "selected_device": "cuda"
+}
+```
 
 ## Scan PDFs
 

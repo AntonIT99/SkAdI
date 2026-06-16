@@ -19,12 +19,14 @@ from app.config import (
     COLLECTION_NAME,
     DEFAULT_REPOSITORY,
     EMBEDDING_BATCH_SIZE,
+    EMBEDDING_DEVICE,
     EMBEDDING_MODEL,
     LLM_MODEL,
     QDRANT_UPSERT_BATCH_SIZE,
     SUPPORTED_LANGUAGES,
     SUPPORTED_REPOSITORIES,
 )
+from app.embeddings import embedding_diagnostics
 from app.rag import RagService
 
 app = FastAPI(title="Private RAG Philosophy Bot")
@@ -58,12 +60,20 @@ def get_rag() -> RagService:
 
 @app.get("/health")
 def health():
+    embedding_info = embedding_diagnostics()
+    gpu_name = _selected_embedding_gpu_name(embedding_info)
+
     response = {
         "status": "ok",
         "qdrant": "ok",
         "collection": COLLECTION_NAME,
         "points_count": 0,
         "embedding_model": EMBEDDING_MODEL,
+        "embedding_device_config": EMBEDDING_DEVICE,
+        "embedding_device_selected": embedding_info["selected_device"],
+        "cuda_available": embedding_info["cuda_available"],
+        "cuda_version": embedding_info["torch_cuda_version"],
+        "gpu_name": gpu_name,
         "default_llm": LLM_MODEL
     }
 
@@ -102,10 +112,16 @@ def debug_config():
         "books_root": str(BOOKS_ROOT.resolve()),
         "collection": COLLECTION_NAME,
         "embedding_model": EMBEDDING_MODEL,
+        "embedding_device_config": EMBEDDING_DEVICE,
         "default_llm": LLM_MODEL,
         "embedding_batch_size": EMBEDDING_BATCH_SIZE,
         "qdrant_upsert_batch_size": QDRANT_UPSERT_BATCH_SIZE
     }
+
+
+@app.get("/debug/embedding")
+def debug_embedding():
+    return embedding_diagnostics()
 
 
 @app.get("/books/scan")
@@ -617,4 +633,23 @@ def _books_root_error() -> str | None:
         return f"BOOKS_ROOT does not exist: {root}"
     if not root.is_dir():
         return f"BOOKS_ROOT is not a directory: {root}"
+    return None
+
+
+def _selected_embedding_gpu_name(embedding_info: dict) -> str | None:
+    selected_device = embedding_info.get("selected_device")
+    if not selected_device or not selected_device.startswith("cuda"):
+        return None
+
+    device_index = 0
+    if ":" in selected_device:
+        try:
+            device_index = int(selected_device.split(":", 1)[1])
+        except ValueError:
+            return None
+
+    for device in embedding_info.get("devices", []):
+        if device.get("index") == device_index:
+            return device.get("name")
+
     return None
