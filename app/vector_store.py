@@ -39,6 +39,12 @@ class VectorStore:
             points=points
         )
 
+    def upsert_no_text_marker(self, point: PointStruct):
+        self.client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=[point]
+        )
+
     def document_exists(self, document_hash: str) -> bool:
         result = self.client.count(
             collection_name=COLLECTION_NAME,
@@ -60,6 +66,93 @@ class VectorStore:
     def points_count(self) -> int:
         collection = self.client.get_collection(collection_name=COLLECTION_NAME)
         return collection.points_count or 0
+
+    def count_document_points(
+        self,
+        document_hash: str | None = None,
+        relative_path: str | None = None,
+        repository: str | None = None,
+        language: str | None = None,
+    ) -> int:
+        result = self.client.count(
+            collection_name=COLLECTION_NAME,
+            count_filter=self._document_filter(
+                document_hash=document_hash,
+                relative_path=relative_path,
+                repository=repository,
+                language=language,
+            ),
+            exact=True,
+        )
+        return result.count
+
+    def delete_document_points(
+        self,
+        document_hash: str | None = None,
+        relative_path: str | None = None,
+        repository: str | None = None,
+        language: str | None = None,
+    ) -> None:
+        self.client.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=self._document_filter(
+                document_hash=document_hash,
+                relative_path=relative_path,
+                repository=repository,
+                language=language,
+            ),
+        )
+
+    def delete_points_by_id(self, point_ids: list[str]) -> None:
+        if not point_ids:
+            return
+
+        self.client.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=point_ids,
+        )
+
+    def list_no_text_documents(
+        self,
+        repository: str | None = None,
+        language: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        records = []
+        offset = None
+        scroll_filter = self._no_text_filter(repository=repository, language=language)
+
+        while len(records) < limit:
+            batch, offset = self.client.scroll(
+                collection_name=COLLECTION_NAME,
+                scroll_filter=scroll_filter,
+                limit=min(100, limit - len(records)),
+                with_payload=True,
+                with_vectors=False,
+                offset=offset,
+            )
+
+            if not batch:
+                break
+
+            for record in batch:
+                payload = record.payload or {}
+                records.append({
+                    "file": payload.get("relative_path"),
+                    "repository": payload.get("repository"),
+                    "language": payload.get("language"),
+                    "document_hash": payload.get("document_hash"),
+                    "status": payload.get("document_status"),
+                    "file_name": payload.get("file_name"),
+                    "topic_path": payload.get("topic_path"),
+                    "extracted_pages": payload.get("extracted_pages"),
+                    "extracted_characters": payload.get("extracted_characters"),
+                })
+
+            if offset is None:
+                break
+
+        return records
 
     def search(
         self,
@@ -142,3 +235,75 @@ class VectorStore:
                 )
             ]
         )
+
+    def _document_filter(
+        self,
+        document_hash: str | None = None,
+        relative_path: str | None = None,
+        repository: str | None = None,
+        language: str | None = None,
+    ) -> Filter:
+        conditions = []
+
+        if document_hash is not None:
+            conditions.append(
+                FieldCondition(
+                    key="document_hash",
+                    match=MatchValue(value=document_hash)
+                )
+            )
+        if relative_path is not None:
+            conditions.append(
+                FieldCondition(
+                    key="relative_path",
+                    match=MatchValue(value=relative_path)
+                )
+            )
+        if repository is not None:
+            conditions.append(
+                FieldCondition(
+                    key="repository",
+                    match=MatchValue(value=repository)
+                )
+            )
+        if language is not None:
+            conditions.append(
+                FieldCondition(
+                    key="language",
+                    match=MatchValue(value=language)
+                )
+            )
+
+        if not conditions:
+            raise ValueError("At least one document selector is required")
+
+        return Filter(must=conditions)
+
+    def _no_text_filter(
+        self,
+        repository: str | None = None,
+        language: str | None = None,
+    ) -> Filter:
+        conditions = [
+            FieldCondition(
+                key="document_status",
+                match=MatchValue(value="no_text")
+            )
+        ]
+
+        if repository is not None:
+            conditions.append(
+                FieldCondition(
+                    key="repository",
+                    match=MatchValue(value=repository)
+                )
+            )
+        if language is not None:
+            conditions.append(
+                FieldCondition(
+                    key="language",
+                    match=MatchValue(value=language)
+                )
+            )
+
+        return Filter(must=conditions)

@@ -116,6 +116,7 @@ class RagService:
 
         if not chunks:
             result["status"] = "no_text"
+            self._upsert_no_text_marker(book, len(pages), extracted_characters, log_prefix)
             logger.info("%s Done: no_text", log_prefix)
             logger.info("%s Total took %.1fs", log_prefix, time.perf_counter() - total_start)
             return result
@@ -137,6 +138,7 @@ class RagService:
             return result
 
         result["chunks"] = inserted_count
+        self._delete_no_text_marker(book.sha256, log_prefix)
         logger.info("%s Upserted %s chunks", log_prefix, inserted_count)
         logger.info("%s Done: indexed", log_prefix)
         logger.info("%s Total took %.1fs", log_prefix, time.perf_counter() - total_start)
@@ -265,6 +267,47 @@ class RagService:
 
     def _point_id(self, document_hash: str, chunk_index: int) -> str:
         return str(uuid5(NAMESPACE_URL, f"{document_hash}:{chunk_index}"))
+
+    def _no_text_marker_id(self, document_hash: str) -> str:
+        return str(uuid5(NAMESPACE_URL, f"{document_hash}:no_text"))
+
+    def _upsert_no_text_marker(
+        self,
+        book: BookFile,
+        extracted_pages: int,
+        extracted_characters: int,
+        log_prefix: str
+    ) -> None:
+        logger.info("%s Writing no_text marker to Qdrant", log_prefix)
+        try:
+            self.vector_store.upsert_no_text_marker(
+                PointStruct(
+                    id=self._no_text_marker_id(book.sha256),
+                    vector=[0.0] * self.vector_store.vector_size,
+                    payload={
+                        "record_type": "document_marker",
+                        "document_hash": book.sha256,
+                        "document_status": "no_text",
+                        "repository": book.repository,
+                        "language": book.language,
+                        "relative_path": book.relative_path,
+                        "topic_path": book.topic_path,
+                        "file_name": book.file_name,
+                        "book": book.absolute_path.stem,
+                        "extracted_pages": extracted_pages,
+                        "extracted_characters": extracted_characters,
+                    },
+                )
+            )
+        except Exception:
+            logger.warning("%s Failed to write no_text marker", log_prefix, exc_info=True)
+
+    def _delete_no_text_marker(self, document_hash: str, log_prefix: str) -> None:
+        try:
+            self.vector_store.delete_points_by_id([self._no_text_marker_id(document_hash)])
+            logger.info("%s Removed no_text marker if present", log_prefix)
+        except Exception:
+            logger.warning("%s Failed to remove no_text marker", log_prefix, exc_info=True)
 
     def _ingest_log_prefix(self, index: int | None, total: int | None) -> str:
         if index is not None and total is not None:

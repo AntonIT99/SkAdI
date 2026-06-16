@@ -219,9 +219,11 @@ curl.exe http://localhost:8000/health
 curl.exe http://localhost:8000/debug/embedding
 curl.exe http://localhost:8000/debug/config
 curl.exe http://localhost:8000/debug/routes
+curl.exe http://localhost:8000/books/hashes
 curl.exe -X POST "http://localhost:8000/ingest/all?dry_run=true&limit=3"
 curl.exe -X POST "http://localhost:8000/ingest/all?limit=1&sort_by=size&max_mb=20"
 curl.exe -X POST "http://localhost:8000/ingest/test-one?repository=default&language=de"
+curl.exe http://localhost:8000/books/no-text
 ```
 
 Useful ingestion query parameters:
@@ -237,6 +239,54 @@ force_reindex=true
 ```
 
 `force_reindex=true` disables the complete-document hash skip. It does not delete old chunks for changed files; it only writes the current document chunks.
+
+List books and SHA-256 hashes:
+
+```powershell
+curl.exe http://localhost:8000/books/hashes
+curl.exe "http://localhost:8000/books/hashes?repository=default&language=de&sort_by=path"
+```
+
+Response shape:
+
+```json
+{
+  "status": "ok",
+  "books_root": "C:\\Users\\alpha\\OneDrive\\Dokumente\\Books",
+  "selected": 1,
+  "books": [
+    {
+      "file": "default/de/philosophy/example.pdf",
+      "repository": "default",
+      "language": "de",
+      "document_hash": "...",
+      "topic_path": "philosophy",
+      "file_name": "example.pdf"
+    }
+  ]
+}
+```
+
+List PDFs that produced no extractable text during ingestion:
+
+```powershell
+curl.exe http://localhost:8000/books/no-text
+curl.exe "http://localhost:8000/books/no-text?repository=default&language=de"
+```
+
+Remove a book from Qdrant by relative path or document hash:
+
+```powershell
+curl.exe -X POST http://localhost:8000/deindex `
+  -H "Content-Type: application/json" `
+  -d "{\"relative_path\":\"default/de/philosophy/example.pdf\"}"
+```
+
+```powershell
+curl.exe -X POST http://localhost:8000/deindex `
+  -H "Content-Type: application/json" `
+  -d "{\"document_hash\":\"...\"}"
+```
 
 Embedding diagnostics:
 

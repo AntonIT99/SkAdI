@@ -40,6 +40,13 @@ class IngestRequest(BaseModel):
     repository: str = DEFAULT_REPOSITORY
 
 
+class DeindexRequest(BaseModel):
+    document_hash: str | None = None
+    relative_path: str | None = None
+    repository: str | None = None
+    language: str | None = None
+
+
 class ChatRequest(BaseModel):
     question: str
     repository: str = DEFAULT_REPOSITORY
@@ -142,6 +149,76 @@ def books_scan():
     }
 
 
+@app.get("/books/hashes")
+def books_hashes(
+    repository: str | None = None,
+    language: str | None = None,
+    sort_by: str = Query(default="path", pattern="^(path|size)$"),
+    max_mb: float | None = Query(default=None, ge=0),
+    limit: int | None = Query(default=None, ge=0),
+):
+    if repository is not None:
+        _validate_values([repository], SUPPORTED_REPOSITORIES, "repository")
+    if language is not None:
+        _validate_values([language], SUPPORTED_LANGUAGES, "language")
+
+    try:
+        candidates = _discover_book_candidates()
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        return {
+            "status": "error",
+            "message": str(exc)
+        }
+
+    discovered_count = len(candidates)
+    candidates = _select_candidates(
+        candidates,
+        repository=repository,
+        language=language,
+        sort_by=sort_by,
+        max_mb=max_mb,
+    )
+    selected_before_limit = len(candidates)
+
+    if limit is not None:
+        candidates = candidates[:limit]
+
+    books = _hash_selected_candidates(candidates)
+
+    return {
+        "status": "ok",
+        "books_root": str(BOOKS_ROOT.resolve()),
+        "discovered": discovered_count,
+        "selected": len(books),
+        "selected_before_limit": selected_before_limit,
+        "books": [_book_hash_result(book) for book in books],
+    }
+
+
+@app.get("/books/no-text")
+def books_no_text(
+    repository: str | None = None,
+    language: str | None = None,
+    limit: int = Query(default=100, ge=1, le=1000),
+):
+    if repository is not None:
+        _validate_values([repository], SUPPORTED_REPOSITORIES, "repository")
+    if language is not None:
+        _validate_values([language], SUPPORTED_LANGUAGES, "language")
+
+    books = get_rag().vector_store.list_no_text_documents(
+        repository=repository,
+        language=language,
+        limit=limit,
+    )
+
+    return {
+        "status": "ok",
+        "count": len(books),
+        "books": books,
+    }
+
+
 @app.post("/ingest")
 def ingest(request: IngestRequest):
     logger.info("[INGEST] /ingest endpoint entered")
@@ -162,6 +239,44 @@ def ingest(request: IngestRequest):
         }
 
     return get_rag().ingest_book(book)
+
+
+@app.post("/deindex")
+def deindex(request: DeindexRequest):
+    logger.info("[DEINDEX] /deindex endpoint entered")
+
+    if request.repository is not None:
+        _validate_values([request.repository], SUPPORTED_REPOSITORIES, "repository")
+    if request.language is not None:
+        _validate_values([request.language], SUPPORTED_LANGUAGES, "language")
+
+    relative_path = _normalize_relative_path(request.relative_path)
+    if not request.document_hash and not relative_path:
+        raise HTTPException(
+            status_code=422,
+            detail="document_hash or relative_path is required"
+        )
+
+    selector = {
+        "document_hash": request.document_hash,
+        "relative_path": relative_path,
+        "repository": request.repository,
+        "language": request.language,
+    }
+    logger.info("[DEINDEX] selector=%s", selector)
+
+    vector_store = get_rag().vector_store
+    matched_points = vector_store.count_document_points(**selector)
+    if matched_points > 0:
+        vector_store.delete_document_points(**selector)
+
+    logger.info("[DEINDEX] deleted %s point(s)", matched_points)
+    return {
+        "status": "ok",
+        "deleted_points": matched_points,
+        "matched_points": matched_points,
+        "selector": selector,
+    }
 
 
 @app.post("/ingest/all")
@@ -437,6 +552,23 @@ def _resolve_book(request: IngestRequest) -> BookFile | None:
     return None
 
 
+def _normalize_relative_path(relative_path: str | None) -> str | None:
+    if not relative_path:
+        return None
+
+    requested_path = Path(relative_path)
+    if requested_path.is_absolute():
+        try:
+            return requested_path.resolve().relative_to(BOOKS_ROOT.resolve()).as_posix()
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="relative_path must point to a file under BOOKS_ROOT"
+            ) from exc
+
+    return relative_path.replace("\\", "/").lstrip("/")
+
+
 def _discover_book_candidates() -> list[dict]:
     root = BOOKS_ROOT.resolve()
 
@@ -601,6 +733,17 @@ def _book_result(
         "status": status,
         "chunks": chunks,
         "error": error
+    }
+
+
+def _book_hash_result(book: BookFile) -> dict:
+    return {
+        "file": book.relative_path,
+        "repository": book.repository,
+        "language": book.language,
+        "document_hash": book.sha256,
+        "topic_path": book.topic_path,
+        "file_name": book.file_name,
     }
 
 
