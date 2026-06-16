@@ -1,16 +1,27 @@
 import logging
+import sys
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
-from app.book_scanner import BookFile, describe_book_file, scan_books
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
+)
+
+from app.book_scanner import BookFile, calculate_sha256, describe_book_file, scan_books
 from app.config import (
     BOOKS_ROOT,
     COLLECTION_NAME,
     DEFAULT_REPOSITORY,
+    EMBEDDING_BATCH_SIZE,
     EMBEDDING_MODEL,
     LLM_MODEL,
+    QDRANT_UPSERT_BATCH_SIZE,
     SUPPORTED_LANGUAGES,
     SUPPORTED_REPOSITORIES,
 )
@@ -18,7 +29,7 @@ from app.rag import RagService
 
 app = FastAPI(title="Private RAG Philosophy Bot")
 
-rag = RagService()
+_rag: RagService | None = None
 logger = logging.getLogger(__name__)
 
 
@@ -35,6 +46,16 @@ class ChatRequest(BaseModel):
     model: str = LLM_MODEL
 
 
+def get_rag() -> RagService:
+    global _rag
+
+    if _rag is None:
+        logger.info("[INGEST] Initializing RAG service")
+        _rag = RagService()
+
+    return _rag
+
+
 @app.get("/health")
 def health():
     response = {
@@ -47,7 +68,7 @@ def health():
     }
 
     try:
-        response["points_count"] = rag.vector_store.points_count()
+        response["points_count"] = get_rag().vector_store.points_count()
     except Exception as exc:
         response["status"] = "degraded"
         response["qdrant"] = "error"
@@ -55,6 +76,36 @@ def health():
         response["qdrant_error"] = str(exc)
 
     return response
+
+
+@app.get("/debug/routes")
+def debug_routes():
+    routes = []
+
+    for route in app.routes:
+        methods = sorted(route.methods or [])
+        routes.append({
+            "path": route.path,
+            "methods": methods,
+            "name": route.name
+        })
+
+    return {
+        "status": "ok",
+        "routes": sorted(routes, key=lambda item: (item["path"], item["methods"]))
+    }
+
+
+@app.get("/debug/config")
+def debug_config():
+    return {
+        "books_root": str(BOOKS_ROOT.resolve()),
+        "collection": COLLECTION_NAME,
+        "embedding_model": EMBEDDING_MODEL,
+        "default_llm": LLM_MODEL,
+        "embedding_batch_size": EMBEDDING_BATCH_SIZE,
+        "qdrant_upsert_batch_size": QDRANT_UPSERT_BATCH_SIZE
+    }
 
 
 @app.get("/books/scan")
@@ -77,6 +128,7 @@ def books_scan():
 
 @app.post("/ingest")
 def ingest(request: IngestRequest):
+    logger.info("[INGEST] /ingest endpoint entered")
     _validate_values([request.repository], SUPPORTED_REPOSITORIES, "repository")
 
     books_root_error = _books_root_error()
@@ -93,7 +145,7 @@ def ingest(request: IngestRequest):
             "message": "File not found in BOOKS_ROOT or not under the expected <repository>/<language>/... structure"
         }
 
-    return rag.ingest_book(book)
+    return get_rag().ingest_book(book)
 
 
 @app.post("/ingest/all")
@@ -101,8 +153,22 @@ def ingest_all(
     limit: int | None = Query(default=None, ge=0),
     repository: str | None = None,
     language: str | None = None,
-    dry_run: bool = False
+    dry_run: bool = False,
+    sort_by: str = Query(default="path", pattern="^(path|size)$"),
+    max_mb: float | None = Query(default=None, ge=0),
+    force_reindex: bool = False
 ):
+    logger.info("[INGEST] /ingest/all endpoint entered")
+    logger.info(
+        "[INGEST] query params: dry_run=%s, limit=%s, repository=%s, language=%s, sort_by=%s, max_mb=%s, force_reindex=%s",
+        dry_run,
+        limit,
+        repository,
+        language,
+        sort_by,
+        max_mb,
+        force_reindex,
+    )
     if repository is not None:
         _validate_values([repository], SUPPORTED_REPOSITORIES, "repository")
     if language is not None:
@@ -113,30 +179,39 @@ def ingest_all(
     logger.info("[INGEST] Scanning for PDF files")
 
     try:
-        books = scan_books()
+        candidates = _discover_book_candidates()
     except (FileNotFoundError, NotADirectoryError) as exc:
         return {
             "status": "error",
             "message": str(exc)
         }
 
-    discovered_count = len(books)
+    discovered_count = len(candidates)
     logger.info("[INGEST] Discovered %s PDF files", discovered_count)
 
-    books = _filter_books(books, repository=repository, language=language)
-    selected_before_limit = len(books)
+    candidates = _select_candidates(
+        candidates,
+        repository=repository,
+        language=language,
+        sort_by=sort_by,
+        max_mb=max_mb,
+    )
+    selected_before_limit = len(candidates)
 
     if limit is not None:
-        books = books[:limit]
+        candidates = candidates[:limit]
 
-    if repository is not None or language is not None or limit is not None:
-        logger.info(
-            "[INGEST] Selected %s PDF files after filters repository=%s language=%s limit=%s",
-            len(books),
-            repository,
-            language,
-            limit,
-        )
+    logger.info(
+        "[INGEST] Selected %s PDF files after filters repository=%s language=%s sort_by=%s max_mb=%s limit=%s",
+        len(candidates),
+        repository,
+        language,
+        sort_by,
+        max_mb,
+        limit,
+    )
+
+    books = _hash_selected_candidates(candidates)
 
     details = []
     total = len(books)
@@ -167,7 +242,14 @@ def ingest_all(
 
     for index, book in enumerate(books, start=1):
         try:
-            details.append(rag.ingest_book(book, index=index, total=total))
+            details.append(
+                get_rag().ingest_book(
+                    book,
+                    index=index,
+                    total=total,
+                    force_reindex=force_reindex,
+                )
+            )
         except Exception as exc:
             logger.exception("[INGEST] [%s/%s] Unexpected ingestion failure", index, total)
             details.append(_book_result(book, status="failed", error=str(exc)))
@@ -216,6 +298,92 @@ def _ingest_all_response(
     return response
 
 
+@app.post("/ingest/test-one")
+def ingest_test_one(
+    relative_path: str | None = None,
+    repository: str | None = None,
+    language: str | None = None,
+    sort_by: str = Query(default="path", pattern="^(path|size)$"),
+    max_mb: float | None = Query(default=None, ge=0),
+    force_reindex: bool = False
+):
+    logger.info("[INGEST] /ingest/test-one endpoint entered")
+    logger.info(
+        "[INGEST] query params: relative_path=%s, repository=%s, language=%s, sort_by=%s, max_mb=%s, force_reindex=%s",
+        relative_path,
+        repository,
+        language,
+        sort_by,
+        max_mb,
+        force_reindex,
+    )
+
+    if repository is not None:
+        _validate_values([repository], SUPPORTED_REPOSITORIES, "repository")
+    if language is not None:
+        _validate_values([language], SUPPORTED_LANGUAGES, "language")
+
+    logger.info("[INGEST] Books root: %s", BOOKS_ROOT.resolve())
+
+    try:
+        if relative_path:
+            candidate = _candidate_from_relative_path(relative_path)
+            candidates = [candidate]
+        else:
+            logger.info("[INGEST] Scanning for first debug PDF")
+            candidates = _select_candidates(
+                _discover_book_candidates(),
+                repository=repository,
+                language=language,
+                sort_by=sort_by,
+                max_mb=max_mb,
+            )
+            candidates = candidates[:1]
+    except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
+        return {
+            "status": "error",
+            "message": str(exc)
+        }
+
+    if not candidates:
+        return {
+            "status": "error",
+            "message": "No matching PDF found"
+        }
+
+    candidate = candidates[0]
+
+    if repository is not None and candidate["repository"] != repository:
+        return {
+            "status": "error",
+            "message": f"Selected file repository is {candidate['repository']}, not {repository}"
+        }
+    if language is not None and candidate["language"] != language:
+        return {
+            "status": "error",
+            "message": f"Selected file language is {candidate['language']}, not {language}"
+        }
+
+    book = _hash_selected_candidates([candidate])[0]
+
+    try:
+        detail = get_rag().ingest_book(
+            book,
+            index=1,
+            total=1,
+            force_reindex=force_reindex,
+        )
+    except Exception as exc:
+        logger.exception("[INGEST] [1/1] Unexpected ingestion failure")
+        detail = _book_result(book, status="failed", error=str(exc))
+
+    return {
+        "status": "ok",
+        "books_root": str(BOOKS_ROOT.resolve()),
+        "detail": detail
+    }
+
+
 @app.post("/chat")
 def chat(request: ChatRequest):
     _validate_values([request.repository], SUPPORTED_REPOSITORIES, "repository")
@@ -226,7 +394,7 @@ def chat(request: ChatRequest):
     if request.languages is not None:
         _validate_values(request.languages, SUPPORTED_LANGUAGES, "languages")
 
-    return rag.chat(
+    return get_rag().chat(
         question=request.question,
         repository=request.repository,
         repositories=repositories,
@@ -253,17 +421,154 @@ def _resolve_book(request: IngestRequest) -> BookFile | None:
     return None
 
 
-def _filter_books(
-    books: list[BookFile],
+def _discover_book_candidates() -> list[dict]:
+    root = BOOKS_ROOT.resolve()
+
+    if not root.exists():
+        raise FileNotFoundError(f"BOOKS_ROOT does not exist: {root}")
+    if not root.is_dir():
+        raise NotADirectoryError(f"BOOKS_ROOT is not a directory: {root}")
+
+    candidates = []
+
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() != ".pdf":
+            continue
+
+        candidate = _candidate_from_path(path, root)
+        if candidate is not None:
+            candidates.append(candidate)
+
+    return candidates
+
+
+def _candidate_from_relative_path(relative_path: str) -> dict:
+    root = BOOKS_ROOT.resolve()
+    requested_path = Path(relative_path)
+
+    if requested_path.is_absolute():
+        absolute_path = requested_path.resolve()
+    else:
+        absolute_path = (root / requested_path).resolve()
+
+    try:
+        absolute_path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("relative_path must point to a PDF under BOOKS_ROOT") from exc
+
+    candidate = _candidate_from_path(absolute_path, root)
+    if candidate is None:
+        raise ValueError(
+            "relative_path must point to a PDF under BOOKS_ROOT/<repository>/<language>/..."
+        )
+
+    return candidate
+
+
+def _candidate_from_path(path: Path, root: Path) -> dict | None:
+    absolute_path = path.resolve()
+
+    if not absolute_path.is_file() or absolute_path.suffix.lower() != ".pdf":
+        return None
+
+    try:
+        relative = absolute_path.relative_to(root)
+    except ValueError:
+        return None
+
+    parts = relative.parts
+    if len(parts) < 3:
+        return None
+
+    repository = parts[0]
+    language = parts[1]
+
+    if repository not in SUPPORTED_REPOSITORIES or language not in SUPPORTED_LANGUAGES:
+        return None
+
+    return {
+        "absolute_path": absolute_path,
+        "relative_path": relative.as_posix(),
+        "repository": repository,
+        "language": language,
+        "topic_path": "/".join(parts[2:-1]),
+        "file_name": absolute_path.name,
+        "size_bytes": absolute_path.stat().st_size,
+    }
+
+
+def _select_candidates(
+    candidates: list[dict],
     repository: str | None,
-    language: str | None
-) -> list[BookFile]:
-    return [
-        book
-        for book in books
-        if (repository is None or book.repository == repository)
-        and (language is None or book.language == language)
+    language: str | None,
+    sort_by: str,
+    max_mb: float | None
+) -> list[dict]:
+    selected = [
+        candidate
+        for candidate in candidates
+        if (repository is None or candidate["repository"] == repository)
+        and (language is None or candidate["language"] == language)
     ]
+
+    if max_mb is not None:
+        max_bytes = max_mb * 1024 * 1024
+        before_max_size = len(selected)
+        selected = [
+            candidate
+            for candidate in selected
+            if candidate["size_bytes"] <= max_bytes
+        ]
+        logger.info(
+            "[INGEST] Size filter max_mb=%s kept %s/%s PDFs",
+            max_mb,
+            len(selected),
+            before_max_size,
+        )
+
+    if sort_by == "size":
+        selected.sort(key=lambda candidate: (candidate["size_bytes"], candidate["relative_path"]))
+    else:
+        selected.sort(key=lambda candidate: candidate["relative_path"])
+
+    return selected
+
+
+def _hash_selected_candidates(candidates: list[dict]) -> list[BookFile]:
+    books = []
+    total = len(candidates)
+
+    logger.info("[INGEST] Hashing %s selected PDF files", total)
+    for index, candidate in enumerate(candidates, start=1):
+        logger.info(
+            "[INGEST] [%s/%s] Hashing %s size=%.2f MB",
+            index,
+            total,
+            candidate["relative_path"],
+            candidate["size_bytes"] / 1024 / 1024,
+        )
+        step_start = time.perf_counter()
+        books.append(_candidate_to_book(candidate))
+        logger.info(
+            "[INGEST] [%s/%s] SHA-256 took %.1fs",
+            index,
+            total,
+            time.perf_counter() - step_start,
+        )
+
+    return books
+
+
+def _candidate_to_book(candidate: dict) -> BookFile:
+    return BookFile(
+        absolute_path=candidate["absolute_path"],
+        relative_path=candidate["relative_path"],
+        repository=candidate["repository"],
+        language=candidate["language"],
+        topic_path=candidate["topic_path"],
+        file_name=candidate["file_name"],
+        sha256=calculate_sha256(candidate["absolute_path"]),
+    )
 
 
 def _book_result(

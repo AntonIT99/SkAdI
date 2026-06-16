@@ -171,9 +171,41 @@ Expected response:
 
 ```json
 {
-  "status": "ok"
+  "status": "ok",
+  "qdrant": "ok",
+  "collection": "books",
+  "points_count": 12345,
+  "embedding_model": "BAAI/bge-m3",
+  "default_llm": "qwen3:14b"
 }
 ```
+
+## Debugging Ingestion
+
+Use these commands when `/ingest/all` appears slow or Qdrant still shows `points_count = 0`:
+
+```powershell
+curl.exe http://localhost:8000/health
+curl.exe http://localhost:8000/debug/config
+curl.exe http://localhost:8000/debug/routes
+curl.exe -X POST "http://localhost:8000/ingest/all?dry_run=true&limit=3"
+curl.exe -X POST "http://localhost:8000/ingest/all?limit=1&sort_by=size&max_mb=20"
+curl.exe -X POST "http://localhost:8000/ingest/test-one?repository=default&language=de"
+```
+
+Useful ingestion query parameters:
+
+```text
+limit=1
+sort_by=path|size
+max_mb=20
+repository=default
+language=de
+dry_run=true
+force_reindex=true
+```
+
+`force_reindex=true` disables the complete-document hash skip. It does not delete old chunks for changed files; it only writes the current document chunks.
 
 ## Scan PDFs
 
